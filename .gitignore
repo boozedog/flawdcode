@@ -1,0 +1,16 @@
+# Binary
+flawdcode
+
+# Air
+tmp/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+.todos/
+.sidecar/
