@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -30,11 +31,18 @@ func NewRawLogModel() RawLogModel {
 // Update handles messages for the raw log tab.
 func (m RawLogModel) Update(msg tea.Msg) (RawLogModel, tea.Cmd) {
 	switch msg := msg.(type) {
-	case ClaudeOutputMsg:
-		m.addLine("\u2190", msg.Type, msg.Line)
-		return m, nil
-	case UserInputMsg:
-		m.addLine("\u2192", "user_message", msg.Line)
+	case ClaudeResponseMsg:
+		if msg.Err != nil {
+			m.addLine("✗", "error", msg.Err.Error())
+		} else {
+			// Show the prompt
+			m.addLine("→", "prompt", msg.Prompt)
+
+			// Show each stdout NDJSON line we received
+			for _, ev := range msg.Response.Events {
+				m.addLine("←", ev.Type, ev.Raw)
+			}
+		}
 		return m, nil
 	}
 
@@ -49,29 +57,33 @@ func (m *RawLogModel) addLine(direction, msgType, rawLine string) {
 		pretty.WriteString(rawLine)
 	}
 
-	var style lipgloss.Style
-	switch msgType {
-	case "system":
-		style = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	case "assistant":
-		style = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	case "result":
-		style = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	case "rate_limit_event":
-		style = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	case "user_message":
-		style = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
-	default:
-		style = lipgloss.NewStyle()
-	}
-
+	ts := time.Now().Format("15:04:05.000")
+	tsStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	style := styleForType(msgType)
 	dirStyle := lipgloss.NewStyle().Bold(true)
-	header := dirStyle.Render(fmt.Sprintf("%s [%s]", direction, msgType))
+	header := tsStyle.Render(ts) + " " + dirStyle.Render(fmt.Sprintf("%s [%s]", direction, msgType))
 	body := style.Render(pretty.String())
 
 	m.lines = append(m.lines, header+"\n"+body)
 	m.viewport.SetContent(strings.Join(m.lines, "\n\n"))
 	m.viewport.GotoBottom()
+}
+
+func styleForType(t string) lipgloss.Style {
+	switch t {
+	case "system":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	case "assistant":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	case "result":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	case "user_message":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
+	case "error":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	default:
+		return lipgloss.NewStyle()
+	}
 }
 
 // SetSize updates the raw log tab dimensions.

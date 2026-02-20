@@ -5,45 +5,31 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-// Model is the root TUI model with tabs for chat and raw log.
+const numTabs = 4
+
+// Model is the root TUI model with tabs for chat, raw log, wire, and debug.
 type Model struct {
-	activeTab int // 0=chat, 1=raw
+	activeTab int // 0=chat, 1=raw, 2=wire, 3=debug
 	width     int
 	height    int
 	chat      ChatModel
 	rawlog    RawLogModel
-	claude    *ClaudeProcess
-	err       error
-	exited    bool
+	wire      WireModel
+	stderrlog StderrModel
 }
 
 // NewModel creates the root model.
 func NewModel() Model {
-	cp := NewClaudeProcess()
-	m := Model{
-		claude: cp,
-		rawlog: NewRawLogModel(),
+	return Model{
+		chat:      NewChatModel(),
+		rawlog:    NewRawLogModel(),
+		wire:      NewWireModel(),
+		stderrlog: NewStderrModel(),
 	}
-	m.chat = NewChatModel(cp.SendMessage)
-	return m
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
-		m.chat.Init(),
-		m.startClaude(),
-	)
-}
-
-func (m Model) startClaude() tea.Cmd {
-	cp := m.claude
-	return func() tea.Msg {
-		if err := cp.Start(); err != nil {
-			return ClaudeExitMsg{Err: err}
-		}
-		go cp.ReadLoop()
-		return <-cp.msgCh
-	}
+	return m.chat.Init()
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -53,7 +39,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "tab":
-			m.activeTab = (m.activeTab + 1) % 2
+			m.activeTab = (m.activeTab + 1) % numTabs
 			if m.activeTab == 0 {
 				cmds = append(cmds, m.chat.textarea.Focus())
 			} else {
@@ -67,8 +53,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeTab = 1
 			m.chat.textarea.Blur()
 			return m, nil
+		case "ctrl+3":
+			m.activeTab = 2
+			m.chat.textarea.Blur()
+			return m, nil
+		case "ctrl+4":
+			m.activeTab = 3
+			m.chat.textarea.Blur()
+			return m, nil
 		case "ctrl+c", "ctrl+q":
-			m.claude.Close()
 			return m, tea.Quit
 		}
 
@@ -78,9 +71,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		contentHeight := m.height - 1
 		m.chat.SetSize(m.width, contentHeight)
 		m.rawlog.SetSize(m.width, contentHeight)
+		m.wire.SetSize(m.width, contentHeight)
+		m.stderrlog.SetSize(m.width, contentHeight)
+		if m.activeTab == 0 {
+			return m, m.chat.textarea.Focus()
+		}
 		return m, nil
 
-	case ClaudeOutputMsg:
+	case ClaudeResponseMsg:
 		var cmd tea.Cmd
 		m.chat, cmd = m.chat.Update(msg)
 		if cmd != nil {
@@ -90,31 +88,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd != nil {
 			cmds = append(cmds, cmd)
 		}
-		cmds = append(cmds, m.claude.WaitForOutput())
-		return m, tea.Batch(cmds...)
-
-	case UserInputMsg:
-		var cmd tea.Cmd
-		m.rawlog, cmd = m.rawlog.Update(msg)
+		m.wire, cmd = m.wire.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		m.stderrlog, cmd = m.stderrlog.Update(msg)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 		return m, tea.Batch(cmds...)
-
-	case ClaudeExitMsg:
-		m.exited = true
-		if msg.Err != nil {
-			m.err = msg.Err
-		}
-		return m, nil
 	}
 
 	// Delegate to active tab
 	var cmd tea.Cmd
-	if m.activeTab == 0 {
+	switch m.activeTab {
+	case 0:
 		m.chat, cmd = m.chat.Update(msg)
-	} else {
+	case 1:
 		m.rawlog, cmd = m.rawlog.Update(msg)
+	case 2:
+		m.wire, cmd = m.wire.Update(msg)
+	case 3:
+		m.stderrlog, cmd = m.stderrlog.Update(msg)
 	}
 	if cmd != nil {
 		cmds = append(cmds, cmd)
@@ -131,13 +126,15 @@ func (m Model) View() tea.View {
 	tabBar := m.renderTabBar()
 
 	var content string
-	if m.err != nil && m.activeTab == 0 && len(m.chat.entries) == 0 {
-		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-		content = errStyle.Render("Error: "+m.err.Error()) + "\n\nPress Ctrl+Q to quit."
-	} else if m.activeTab == 0 {
+	switch m.activeTab {
+	case 0:
 		content = m.chat.View()
-	} else {
+	case 1:
 		content = m.rawlog.View()
+	case 2:
+		content = m.wire.View()
+	case 3:
+		content = m.stderrlog.View()
 	}
 
 	v := tea.NewView(tabBar + "\n" + content)
@@ -158,7 +155,7 @@ func (m Model) renderTabBar() string {
 	helpStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("8"))
 
-	tabs := []string{"Chat", "Raw JSONL"}
+	tabs := []string{"Chat", "Raw JSON", "Wire", "Debug"}
 	var parts []string
 	for i, tab := range tabs {
 		if i == m.activeTab {

@@ -5,41 +5,78 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
-
-	tea "charm.land/bubbletea/v2"
 )
 
-// ClaudeProcess manages the claude subprocess lifecycle.
-type ClaudeProcess struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	stderr bytes.Buffer
-	mu     sync.Mutex
-	msgCh  chan tea.Msg
+// StreamEvent is a single NDJSON line from claude's stdout.
+type StreamEvent struct {
+	Type    string `json:"type"`
+	Subtype string `json:"subtype,omitempty"`
+	Raw     string
 }
 
-// NewClaudeProcess creates a new ClaudeProcess.
-func NewClaudeProcess() *ClaudeProcess {
-	return &ClaudeProcess{
-		msgCh: make(chan tea.Msg, 256),
+// ClaudeResult is the final "result" event from claude.
+type ClaudeResult struct {
+	Type       string  `json:"type"`
+	Subtype    string  `json:"subtype"`
+	Result     string  `json:"result"`
+	IsError    bool    `json:"is_error"`
+	DurationMs int     `json:"duration_ms"`
+	CostUSD    float64 `json:"cost_usd"`
+	SessionID  string  `json:"session_id"`
+}
+
+// ClaudeResponse holds everything from a single claude invocation.
+type ClaudeResponse struct {
+	Command []string
+	Prompt  string
+	Events  []StreamEvent
+	Result  ClaudeResult
+	Stderr  string
+}
+
+// AssistantText extracts the text content from assistant events.
+func (r *ClaudeResponse) AssistantText() string {
+	// Prefer result.result if present
+	if r.Result.Result != "" {
+		return r.Result.Result
 	}
+	// Fall back to extracting from assistant events
+	var last string
+	for _, ev := range r.Events {
+		if ev.Type == "assistant" {
+			var msg struct {
+				Message struct {
+					Content []struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal([]byte(ev.Raw), &msg) == nil {
+				for _, block := range msg.Message.Content {
+					if block.Type == "text" && block.Text != "" {
+						last = block.Text
+					}
+				}
+			}
+		}
+	}
+	return last
 }
 
-// Start spawns the claude subprocess.
-func (c *ClaudeProcess) Start() error {
-	c.cmd = exec.Command("claude", "-p",
-		"--input-format", "stream-json",
+// RunClaude spawns claude in print mode with the prompt as an argument.
+// Output is stream-json (NDJSON).
+func RunClaude(prompt string) (*ClaudeResponse, error) {
+	cmd := exec.Command("claude", "-p",
 		"--output-format", "stream-json",
 		"--verbose",
+		prompt,
 	)
 
-	// Filter out CLAUDECODE env var so claude can launch as a subprocess
+	// Filter out CLAUDECODE env var
 	env := os.Environ()
 	filtered := make([]string, 0, len(env))
 	for _, e := range env {
@@ -47,31 +84,24 @@ func (c *ClaudeProcess) Start() error {
 			filtered = append(filtered, e)
 		}
 	}
-	c.cmd.Env = filtered
-	c.cmd.Stderr = &c.stderr
+	cmd.Env = filtered
 
-	var err error
-	c.stdin, err = c.cmd.StdinPipe()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("stdin pipe: %w", err)
+		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
-	c.stdout, err = c.cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start claude: %w", err)
 	}
 
-	if err := c.cmd.Start(); err != nil {
-		return fmt.Errorf("start claude: %w", err)
-	}
-
-	return nil
-}
-
-// ReadLoop reads stdout line-by-line and sends parsed messages to the channel.
-// Run this in a goroutine.
-func (c *ClaudeProcess) ReadLoop() {
-	scanner := bufio.NewScanner(c.stdout)
+	// Read all NDJSON events from stdout
+	var events []StreamEvent
+	var result ClaudeResult
+	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
 
 	for scanner.Scan() {
@@ -79,63 +109,27 @@ func (c *ClaudeProcess) ReadLoop() {
 		if line == "" {
 			continue
 		}
-		var env StreamMsg
-		if err := json.Unmarshal([]byte(line), &env); err != nil {
+		var ev StreamEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			continue
 		}
-		c.msgCh <- ClaudeOutputMsg{
-			StreamMsg: env,
-			Line:      line,
+		ev.Raw = line
+		events = append(events, ev)
+
+		if ev.Type == "result" {
+			json.Unmarshal([]byte(line), &result)
 		}
 	}
 
-	err := c.cmd.Wait()
-	if err != nil && c.stderr.Len() > 0 {
-		err = fmt.Errorf("%w: %s", err, strings.TrimSpace(c.stderr.String()))
-	}
-	c.msgCh <- ClaudeExitMsg{Err: err}
-}
-
-// WaitForOutput returns a tea.Cmd that blocks until the next message from Claude.
-func (c *ClaudeProcess) WaitForOutput() tea.Cmd {
-	return func() tea.Msg {
-		msg, ok := <-c.msgCh
-		if !ok {
-			return ClaudeExitMsg{Err: nil}
-		}
-		return msg
-	}
-}
-
-// SendMessage writes a user message to Claude's stdin as NDJSON.
-func (c *ClaudeProcess) SendMessage(text string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	msg := UserMessageInput{
-		Type: "user_message",
-		Content: UserMessageContent{
-			Type: "text",
-			Text: text,
-		},
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("claude: %w\nstderr: %s", err, stderr.String())
 	}
 
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return "", err
-	}
-	data = append(data, '\n')
-
-	_, err = c.stdin.Write(data)
-	return string(data[:len(data)-1]), err
-}
-
-// Close kills the subprocess.
-func (c *ClaudeProcess) Close() {
-	if c.stdin != nil {
-		c.stdin.Close()
-	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		c.cmd.Process.Kill()
-	}
+	return &ClaudeResponse{
+		Command: cmd.Args,
+		Prompt:  prompt,
+		Events:  events,
+		Result:  result,
+		Stderr:  stderr.String(),
+	}, nil
 }
