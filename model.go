@@ -5,26 +5,22 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-const numTabs = 4
+const numTabs = 2
 
-// Model is the root TUI model with tabs for chat, raw log, wire, and debug.
+// Model is the root TUI model with tabs for chat and wire.
 type Model struct {
-	activeTab int // 0=chat, 1=raw, 2=wire, 3=debug
+	activeTab int // 0=chat, 1=wire
 	width     int
 	height    int
 	chat      ChatModel
-	rawlog    RawLogModel
 	wire      WireModel
-	stderrlog StderrModel
 }
 
 // NewModel creates the root model.
 func NewModel() Model {
 	return Model{
-		chat:      NewChatModel(),
-		rawlog:    NewRawLogModel(),
-		wire:      NewWireModel(),
-		stderrlog: NewStderrModel(),
+		chat: NewChatModel(),
+		wire: NewWireModel(),
 	}
 }
 
@@ -53,14 +49,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeTab = 1
 			m.chat.textarea.Blur()
 			return m, nil
-		case "ctrl+3":
-			m.activeTab = 2
-			m.chat.textarea.Blur()
-			return m, nil
-		case "ctrl+4":
-			m.activeTab = 3
-			m.chat.textarea.Blur()
-			return m, nil
 		case "ctrl+c", "ctrl+q":
 			return m, tea.Quit
 		}
@@ -70,9 +58,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		contentHeight := m.height - 1
 		m.chat.SetSize(m.width, contentHeight)
-		m.rawlog.SetSize(m.width, contentHeight)
 		m.wire.SetSize(m.width, contentHeight)
-		m.stderrlog.SetSize(m.width, contentHeight)
 		if m.activeTab == 0 {
 			return m, m.chat.textarea.Focus()
 		}
@@ -84,15 +70,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd != nil {
 			cmds = append(cmds, cmd)
 		}
-		m.rawlog, cmd = m.rawlog.Update(msg)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
 		m.wire, cmd = m.wire.Update(msg)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		m.stderrlog, cmd = m.stderrlog.Update(msg)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
 		}
@@ -105,11 +83,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case 0:
 		m.chat, cmd = m.chat.Update(msg)
 	case 1:
-		m.rawlog, cmd = m.rawlog.Update(msg)
-	case 2:
 		m.wire, cmd = m.wire.Update(msg)
-	case 3:
-		m.stderrlog, cmd = m.stderrlog.Update(msg)
 	}
 	if cmd != nil {
 		cmds = append(cmds, cmd)
@@ -130,11 +104,7 @@ func (m Model) View() tea.View {
 	case 0:
 		content = m.chat.View()
 	case 1:
-		content = m.rawlog.View()
-	case 2:
 		content = m.wire.View()
-	case 3:
-		content = m.stderrlog.View()
 	}
 
 	v := tea.NewView(tabBar + "\n" + content)
@@ -155,7 +125,7 @@ func (m Model) renderTabBar() string {
 	helpStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("8"))
 
-	tabs := []string{"Chat", "Raw JSON", "Wire", "Debug"}
+	tabs := []string{"Chat", "Wire"}
 	var parts []string
 	for i, tab := range tabs {
 		if i == m.activeTab {

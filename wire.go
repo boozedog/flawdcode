@@ -32,31 +32,33 @@ func (m WireModel) Update(msg tea.Msg) (WireModel, tea.Cmd) {
 		stderrStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 		dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-
-		ts := time.Now().Format("15:04:05.000")
 		tsStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-		timestamp := tsStyle.Render(ts)
+
+		fmtTS := func(t time.Time) string {
+			return tsStyle.Render(t.Format("15:04:05.000"))
+		}
 
 		if msg.Err != nil {
-			m.lines = append(m.lines, timestamp+" "+errStyle.Render(fmt.Sprintf("error: %s", msg.Err)))
+			m.lines = append(m.lines, fmtTS(time.Now())+" "+errStyle.Render(fmt.Sprintf("error: %s", msg.Err)))
 		} else {
 			r := msg.Response
 
 			// The command
-			m.lines = append(m.lines, timestamp+" "+cmdStyle.Render("$ "+strings.Join(r.Command, " ")))
+			m.lines = append(m.lines, fmtTS(r.StartedAt)+" "+cmdStyle.Render("$ "+strings.Join(r.Command, " ")))
 
 			// prompt (passed as argument)
-			m.lines = append(m.lines, timestamp+" "+stdinStyle.Render("prompt> ")+r.Prompt)
+			m.lines = append(m.lines, fmtTS(r.StartedAt)+" "+stdinStyle.Render("prompt> ")+r.Prompt)
 
 			// stdout (each raw NDJSON line)
 			for _, ev := range r.Events {
-				m.lines = append(m.lines, timestamp+" "+stdoutStyle.Render("stdout< ")+ev.Raw)
+				m.lines = append(m.lines, fmtTS(ev.ReceivedAt)+" "+stdoutStyle.Render("stdout< ")+ev.Raw)
 			}
 
 			// stderr
 			if r.Stderr != "" {
+				now := time.Now()
 				for _, line := range strings.Split(strings.TrimSpace(r.Stderr), "\n") {
-					m.lines = append(m.lines, timestamp+" "+stderrStyle.Render("stderr| ")+line)
+					m.lines = append(m.lines, fmtTS(now)+" "+stderrStyle.Render("stderr| ")+line)
 				}
 			}
 
