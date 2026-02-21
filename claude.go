@@ -406,11 +406,15 @@ func extractDeltas(raw string) streamDeltas {
 	return streamDeltas{}
 }
 
+// wireLogEnabled controls whether wire logging to /tmp is active.
+// Set via --wire-log flag at startup.
+var wireLogEnabled bool
+
 // wireLogPath is the path to the current session's wire log file.
 // Set once on first StreamClaude call; subsequent calls append to the same file.
 var wireLogPath string
 
-// WireLogPath returns the current wire log file path (empty if no session yet).
+// WireLogPath returns the current wire log file path (empty if logging is disabled or no session yet).
 func WireLogPath() string {
 	return wireLogPath
 }
@@ -449,12 +453,16 @@ func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, error) {
 	}
 
 	// Open wire log file (one per app session, append across requests)
-	if wireLogPath == "" {
-		wireLogPath = fmt.Sprintf("/tmp/flawdcode-%s.jsonl", startedAt.Format("20060102-150405"))
-	}
-	wireLog, wireLogErr := os.OpenFile(wireLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if wireLogErr != nil {
-		wireLog = nil // non-fatal, just skip logging
+	var wireLog *os.File
+	if wireLogEnabled {
+		if wireLogPath == "" {
+			wireLogPath = fmt.Sprintf("/tmp/flawdcode-%s.jsonl", startedAt.Format("20060102-150405"))
+		}
+		var wireLogErr error
+		wireLog, wireLogErr = os.OpenFile(wireLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if wireLogErr != nil {
+			wireLog = nil // non-fatal, just skip logging
+		}
 	}
 
 	ch := make(chan StreamMsg, 64)

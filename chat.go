@@ -962,9 +962,6 @@ func (m ChatModel) renderStatusLine() string {
 
 	if m.totalRequests == 0 && m.initReceived {
 		info := m.initModel + " ready"
-		if p := WireLogPath(); p != "" {
-			info += " · wire: " + p
-		}
 		return dimStyle.Render(info)
 	} else if m.totalRequests == 0 {
 		return dimStyle.Render("ready")
