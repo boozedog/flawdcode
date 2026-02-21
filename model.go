@@ -36,6 +36,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "tab":
 			m.activeTab = (m.activeTab + 1) % numTabs
+			m.chat.scrollMode = false
 			if m.activeTab == 0 {
 				cmds = append(cmds, m.chat.textarea.Focus())
 			} else {
@@ -44,9 +45,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		case "ctrl+1":
 			m.activeTab = 0
+			m.chat.scrollMode = false
 			return m, m.chat.textarea.Focus()
 		case "ctrl+2":
 			m.activeTab = 1
+			m.chat.scrollMode = false
 			m.chat.textarea.Blur()
 			return m, nil
 		case "ctrl+c", "ctrl+q":
@@ -56,7 +59,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		contentHeight := m.height - 1
+		tabBarHeight := 2
+		contentHeight := m.height - tabBarHeight
 		m.chat.SetSize(m.width, contentHeight)
 		m.wire.SetSize(m.width, contentHeight)
 		if m.activeTab == 0 {
@@ -65,6 +69,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ClaudeResponseMsg:
+		var cmd tea.Cmd
+		m.chat, cmd = m.chat.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		m.wire, cmd = m.wire.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
+
+	case ClaudeStreamStartMsg, ClaudeStreamChunkMsg, ClaudeStreamDoneMsg:
 		var cmd tea.Cmd
 		m.chat, cmd = m.chat.Update(msg)
 		if cmd != nil {
@@ -94,7 +110,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() tea.View {
 	if m.width == 0 {
-		return tea.NewView("Starting...")
+		v := tea.NewView("Starting...")
+		v.AltScreen = true
+		v.MouseMode = tea.MouseModeCellMotion
+		return v
 	}
 
 	tabBar := m.renderTabBar()
@@ -107,7 +126,7 @@ func (m Model) View() tea.View {
 		content = m.wire.View()
 	}
 
-	v := tea.NewView(tabBar + "\n" + content)
+	v := tea.NewView(tabBar + "\n\n" + content)
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
 	return v
