@@ -1,14 +1,33 @@
 package main
 
 import (
+	"os/exec"
+	"syscall"
+	"time"
+
 	tea "charm.land/bubbletea/v2"
 )
+
+// gracefulKill sends SIGTERM and falls back to SIGKILL after a timeout.
+// The process is expected to be reaped by the StreamClaude goroutine;
+// this only ensures escalation if SIGTERM is not honoured.
+func gracefulKill(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	go func() {
+		time.Sleep(3 * time.Second)
+		// Best-effort SIGKILL; harmless if process already exited.
+		_ = cmd.Process.Kill()
+	}()
+}
 
 // Model is the root TUI model.
 type Model struct {
 	width  int
 	height int
-	chat   ChatModel
+	chat   *ChatModel
 }
 
 // NewModel creates the root model.
@@ -27,6 +46,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "ctrl+c", "ctrl+q":
+			if m.chat.streamCmd != nil {
+				gracefulKill(m.chat.streamCmd)
+			}
+			if m.chat.iSession != nil {
+				m.chat.iSession.Close()
+			}
 			return m, tea.Quit
 		}
 
@@ -37,8 +62,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.chat.textarea.Focus()
 	}
 
-	var cmd tea.Cmd
-	m.chat, cmd = m.chat.Update(msg)
+	cmd := m.chat.Update(msg)
 	return m, cmd
 }
 

@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -80,23 +82,59 @@ type TaskResultMeta struct {
 	TotalToolUseCount int
 }
 
+// BlockKind identifies the type of a ChatBlock.
+type BlockKind string
+
+const (
+	BlockText       BlockKind = "text"
+	BlockToolUse    BlockKind = "tool_use"
+	BlockToolResult BlockKind = "tool_result"
+)
+
 // ChatBlock represents a renderable block in the chat: text, tool call, or tool result.
+// Use the constructor functions (NewTextBlock, NewToolUseBlock, NewToolResultBlock) for clarity.
 type ChatBlock struct {
-	Kind       string // "text", "tool_use", "tool_result"
-	Text       string
+	Kind BlockKind
+
+	// Text fields — set when Kind=BlockText
+	Text string
+
+	// Tool fields — set when Kind=BlockToolUse or BlockToolResult
 	ToolName   string
 	ToolID     string
 	ToolInput  string
 	ToolOutput string
 	IsError    bool
 
-	// Task (subagent) fields — only set when Kind="tool_use" and ToolName="Task"
+	// Task (subagent) fields — only set when Kind=BlockToolUse and IsTask=true
 	IsTask           bool
 	TaskDescription  string
 	TaskSubagentType string
 	TaskPrompt       string
 	TaskSubBlocks    []ChatBlock
 	TaskMeta         *TaskResultMeta
+}
+
+// NewTextBlock creates a text content block.
+func NewTextBlock(text string) ChatBlock {
+	return ChatBlock{Kind: BlockText, Text: text}
+}
+
+// NewToolUseBlock creates a tool use block.
+func NewToolUseBlock(name, id, input string) ChatBlock {
+	return ChatBlock{Kind: BlockToolUse, ToolName: name, ToolID: id, ToolInput: input}
+}
+
+// NewTaskBlock creates a Task (subagent) tool use block.
+func NewTaskBlock(id, input string) ChatBlock {
+	cb := ChatBlock{Kind: BlockToolUse, ToolName: "Task", ToolID: id, ToolInput: input, IsTask: true}
+	parseTaskInput(&cb, input)
+	return cb
+}
+
+// NewToolResultBlock creates a tool result block.
+func NewToolResultBlock(toolID, output string, isError bool) ChatBlock {
+	return ChatBlock{Kind: BlockToolResult, ToolID: toolID, ToolOutput: output, IsError: isError}
 }
 
 // parseTaskInput extracts Task tool input fields from JSON into the ChatBlock.
@@ -127,7 +165,7 @@ func extractParentToolUseID(raw string) string {
 // findTaskBlockIndex returns the index of the Task block with the given ToolID, or -1.
 func findTaskBlockIndex(blocks []ChatBlock, toolID string) int {
 	for i := range blocks {
-		if blocks[i].Kind == "tool_use" && blocks[i].IsTask && blocks[i].ToolID == toolID {
+		if blocks[i].Kind == BlockToolUse && blocks[i].IsTask && blocks[i].ToolID == toolID {
 			return i
 		}
 	}
@@ -155,8 +193,9 @@ func parseToolUseResult(raw string) *TaskResultMeta {
 	return nil
 }
 
-// extractTaskResultContent is like extractToolResultContent but strips the agentId metadata block.
-func extractTaskResultContent(content any) string {
+// extractToolResultContent converts tool result content (string, array, or other) to a string.
+// If stripAgentID is true, text blocks prefixed with "agentId:" are excluded (used for Task results).
+func extractToolResultContent(content any, stripAgentID bool) string {
 	switch v := content.(type) {
 	case string:
 		return v
@@ -165,9 +204,10 @@ func extractTaskResultContent(content any) string {
 		for _, item := range v {
 			if m, ok := item.(map[string]any); ok {
 				if t, ok := m["text"].(string); ok {
-					if !strings.HasPrefix(t, "agentId:") {
-						out += t
+					if stripAgentID && strings.HasPrefix(t, "agentId:") {
+						continue
 					}
+					out += t
 				}
 			}
 		}
@@ -203,16 +243,11 @@ func (r *ClaudeResponse) ExtractBlocks() []ChatBlock {
 					if block.Type == "tool_use" {
 						inputStr := "{}"
 						if len(block.Input) > 0 {
-							var pretty bytes.Buffer
-							if json.Indent(&pretty, block.Input, "", "  ") == nil {
-								inputStr = pretty.String()
-							} else {
-								inputStr = string(block.Input)
-							}
+							inputStr = prettyJSON(block.Input)
 						}
 						if idx := findTaskBlockIndex(blocks, parentID); idx >= 0 {
 							blocks[idx].TaskSubBlocks = append(blocks[idx].TaskSubBlocks, ChatBlock{
-								Kind:      "tool_use",
+								Kind:      BlockToolUse,
 								ToolName:  block.Name,
 								ToolID:    block.ID,
 								ToolInput: inputStr,
@@ -228,20 +263,15 @@ func (r *ClaudeResponse) ExtractBlocks() []ChatBlock {
 				switch block.Type {
 				case "text":
 					if block.Text != "" {
-						blocks = append(blocks, ChatBlock{Kind: "text", Text: block.Text})
+						blocks = append(blocks, ChatBlock{Kind: BlockText, Text: block.Text})
 					}
 				case "tool_use":
 					inputStr := "{}"
 					if len(block.Input) > 0 {
-						var pretty bytes.Buffer
-						if json.Indent(&pretty, block.Input, "", "  ") == nil {
-							inputStr = pretty.String()
-						} else {
-							inputStr = string(block.Input)
-						}
+						inputStr = prettyJSON(block.Input)
 					}
 					cb := ChatBlock{
-						Kind:      "tool_use",
+						Kind:      BlockToolUse,
 						ToolName:  block.Name,
 						ToolID:    block.ID,
 						ToolInput: inputStr,
@@ -261,15 +291,10 @@ func (r *ClaudeResponse) ExtractBlocks() []ChatBlock {
 			if json.Unmarshal([]byte(ev.Raw), &cbs) == nil && cbs.ContentBlock.Type == "tool_use" {
 				inputStr := "{}"
 				if len(cbs.ContentBlock.Input) > 0 {
-					var pretty bytes.Buffer
-					if json.Indent(&pretty, cbs.ContentBlock.Input, "", "  ") == nil {
-						inputStr = pretty.String()
-					} else {
-						inputStr = string(cbs.ContentBlock.Input)
-					}
+					inputStr = prettyJSON(cbs.ContentBlock.Input)
 				}
 				cb := ChatBlock{
-					Kind:      "tool_use",
+					Kind:      BlockToolUse,
 					ToolName:  cbs.ContentBlock.Name,
 					ToolID:    cbs.ContentBlock.ID,
 					ToolInput: inputStr,
@@ -299,10 +324,10 @@ func (r *ClaudeResponse) ExtractBlocks() []ChatBlock {
 				// Subagent user event — route tool_result blocks to parent Task
 				for _, block := range msg.Message.Content {
 					if block.Type == "tool_result" {
-						output := extractToolResultContent(block.Content)
+						output := extractToolResultContent(block.Content, false)
 						if idx := findTaskBlockIndex(blocks, parentID); idx >= 0 {
 							blocks[idx].TaskSubBlocks = append(blocks[idx].TaskSubBlocks, ChatBlock{
-								Kind:       "tool_result",
+								Kind:       BlockToolResult,
 								ToolID:     block.ToolUseID,
 								ToolOutput: output,
 								IsError:    block.IsError,
@@ -319,13 +344,13 @@ func (r *ClaudeResponse) ExtractBlocks() []ChatBlock {
 					var output string
 					if idx := findTaskBlockIndex(blocks, block.ToolUseID); idx >= 0 {
 						// Task result — strip agentId block and parse metadata
-						output = extractTaskResultContent(block.Content)
+						output = extractToolResultContent(block.Content, true)
 						blocks[idx].TaskMeta = parseToolUseResult(ev.Raw)
 					} else {
-						output = extractToolResultContent(block.Content)
+						output = extractToolResultContent(block.Content, false)
 					}
 					blocks = append(blocks, ChatBlock{
-						Kind:       "tool_result",
+						Kind:       BlockToolResult,
 						ToolID:     block.ToolUseID,
 						ToolOutput: output,
 						IsError:    block.IsError,
@@ -368,6 +393,15 @@ func (r *ClaudeResponse) AssistantText() string {
 	return last
 }
 
+// prettyJSON formats raw JSON with indentation, falling back to the raw string on error.
+func prettyJSON(raw []byte) string {
+	var pretty bytes.Buffer
+	if json.Indent(&pretty, raw, "", "  ") == nil {
+		return pretty.String()
+	}
+	return string(raw)
+}
+
 // streamDeltas holds extracted text, thinking, and tool input content from a content_block_delta event.
 type streamDeltas struct {
 	Text      string
@@ -406,22 +440,25 @@ func extractDeltas(raw string) streamDeltas {
 	return streamDeltas{}
 }
 
-// wireLogEnabled controls whether wire logging to /tmp is active.
-// Set via --wire-log flag at startup.
-var wireLogEnabled bool
+// wireLogConfig holds wire logging state, safe for concurrent access.
+var wireLog struct {
+	enabled atomic.Bool
+	path    string
+	once    sync.Once
+}
 
-// wireLogPath is the path to the current session's wire log file.
-// Set once on first StreamClaude call; subsequent calls append to the same file.
-var wireLogPath string
+// SetWireLogEnabled sets whether wire logging is active.
+func SetWireLogEnabled(enabled bool) {
+	wireLog.enabled.Store(enabled)
+}
 
 // WireLogPath returns the current wire log file path (empty if logging is disabled or no session yet).
 func WireLogPath() string {
-	return wireLogPath
+	return wireLog.path
 }
 
-// StreamClaude spawns claude in print mode and returns a channel that emits
-// events incrementally. The channel is closed after the final StreamMsg{Done: true}.
-func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, error) {
+// buildClaudeCmd constructs the exec.Cmd for a claude invocation with args and filtered env.
+func buildClaudeCmd(prompt, sessionID string) *exec.Cmd {
 	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"}
 	if sessionID != "" {
 		args = append(args, "--resume", sessionID)
@@ -439,9 +476,53 @@ func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, error) {
 	}
 	cmd.Env = filtered
 
+	return cmd
+}
+
+// parseEventLine parses one NDJSON line, updating result/model/stopReason as needed.
+// Returns the parsed StreamEvent (nil if line is not valid JSON) and any result unmarshal error.
+func parseEventLine(line string, result *ClaudeResult, model *string, stopReason *string) (*StreamEvent, error) {
+	var ev StreamEvent
+	if err := json.Unmarshal([]byte(line), &ev); err != nil {
+		return nil, nil
+	}
+	ev.Raw = line
+	ev.ReceivedAt = time.Now()
+
+	var resultErr error
+	switch ev.Type {
+	case "result":
+		if err := json.Unmarshal([]byte(line), result); err != nil {
+			resultErr = fmt.Errorf("result unmarshal: %w", err)
+		}
+	case "assistant":
+		var msg struct {
+			Message struct {
+				Model      string `json:"model"`
+				StopReason string `json:"stop_reason"`
+			} `json:"message"`
+		}
+		if json.Unmarshal([]byte(line), &msg) == nil {
+			if msg.Message.Model != "" {
+				*model = msg.Message.Model
+			}
+			if msg.Message.StopReason != "" {
+				*stopReason = msg.Message.StopReason
+			}
+		}
+	}
+
+	return &ev, resultErr
+}
+
+// StreamClaude spawns claude in print mode and returns a channel that emits
+// events incrementally. The channel is closed after the final StreamMsg{Done: true}.
+func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, *exec.Cmd, error) {
+	cmd := buildClaudeCmd(prompt, sessionID)
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
+		return nil, nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
 	var stderr bytes.Buffer
@@ -449,19 +530,19 @@ func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, error) {
 
 	startedAt := time.Now()
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start claude: %w", err)
+		return nil, nil, fmt.Errorf("start claude: %w", err)
 	}
 
 	// Open wire log file (one per app session, append across requests)
-	var wireLog *os.File
-	if wireLogEnabled {
-		if wireLogPath == "" {
-			wireLogPath = fmt.Sprintf("/tmp/flawdcode-%s.jsonl", startedAt.Format("20060102-150405"))
-		}
+	var wl *os.File
+	if wireLog.enabled.Load() {
+		wireLog.once.Do(func() {
+			wireLog.path = fmt.Sprintf("/tmp/flawdcode-%s.jsonl", startedAt.Format("20060102-150405"))
+		})
 		var wireLogErr error
-		wireLog, wireLogErr = os.OpenFile(wireLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		wl, wireLogErr = os.OpenFile(wireLog.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 		if wireLogErr != nil {
-			wireLog = nil // non-fatal, just skip logging
+			wl = nil // non-fatal, just skip logging
 		}
 	}
 
@@ -469,8 +550,8 @@ func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, error) {
 
 	go func() {
 		defer close(ch)
-		if wireLog != nil {
-			defer wireLog.Close()
+		if wl != nil {
+			defer wl.Close()
 			// Log the outbound prompt as a synthetic event
 			header, _ := json.Marshal(map[string]any{
 				"_wire":      "request",
@@ -479,7 +560,7 @@ func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, error) {
 				"session_id": sessionID,
 				"command":    cmd.Args,
 			})
-			fmt.Fprintf(wireLog, "%s\n", header)
+			fmt.Fprintf(wl, "%s\n", header)
 		}
 
 		var events []StreamEvent
@@ -496,39 +577,37 @@ func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, error) {
 			}
 
 			// Tee raw line to wire log
-			if wireLog != nil {
-				fmt.Fprintf(wireLog, "%s\n", line)
+			if wl != nil {
+				fmt.Fprintf(wl, "%s\n", line)
 			}
 
-			var ev StreamEvent
-			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			ev, resultErr := parseEventLine(line, &result, &model, &stopReason)
+			if ev == nil {
 				continue
 			}
-			ev.Raw = line
-			ev.ReceivedAt = time.Now()
-			events = append(events, ev)
-
-			switch ev.Type {
-			case "result":
-				json.Unmarshal([]byte(line), &result)
-			case "assistant":
-				var msg struct {
-					Message struct {
-						Model      string `json:"model"`
-						StopReason string `json:"stop_reason"`
-					} `json:"message"`
-				}
-				if json.Unmarshal([]byte(line), &msg) == nil {
-					if msg.Message.Model != "" {
-						model = msg.Message.Model
-					}
-					if msg.Message.StopReason != "" {
-						stopReason = msg.Message.StopReason
-					}
-				}
+			if resultErr != nil && wl != nil {
+				errJSON, _ := json.Marshal(map[string]any{
+					"_wire": "error",
+					"_ts":   time.Now().Format(time.RFC3339Nano),
+					"error": resultErr.Error(),
+				})
+				fmt.Fprintf(wl, "%s\n", errJSON)
 			}
+			events = append(events, *ev)
 
-			ch <- StreamMsg{Event: &ev}
+			ch <- StreamMsg{Event: ev}
+		}
+
+		if scanErr := scanner.Err(); scanErr != nil {
+			if wl != nil {
+				errJSON, _ := json.Marshal(map[string]any{
+					"_wire":  "error",
+					"_ts":    time.Now().Format(time.RFC3339Nano),
+					"error":  scanErr.Error(),
+					"source": "scanner",
+				})
+				fmt.Fprintf(wl, "%s\n", errJSON)
+			}
 		}
 
 		waitErr := cmd.Wait()
@@ -545,16 +624,16 @@ func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, error) {
 		}
 
 		// Log completion to wire log
-		if wireLog != nil {
+		if wl != nil {
 			trailer, _ := json.Marshal(map[string]any{
-				"_wire":     "done",
-				"_ts":       time.Now().Format(time.RFC3339Nano),
-				"exit_err":  fmt.Sprintf("%v", waitErr),
-				"stderr":    stderr.String(),
-				"model":     model,
-				"stop":      stopReason,
+				"_wire":    "done",
+				"_ts":      time.Now().Format(time.RFC3339Nano),
+				"exit_err": fmt.Sprintf("%v", waitErr),
+				"stderr":   stderr.String(),
+				"model":    model,
+				"stop":     stopReason,
 			})
-			fmt.Fprintf(wireLog, "%s\n", trailer)
+			fmt.Fprintf(wl, "%s\n", trailer)
 		}
 
 		if waitErr != nil {
@@ -567,7 +646,7 @@ func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, error) {
 		}
 	}()
 
-	return ch, nil
+	return ch, cmd, nil
 }
 
 // waitForStreamMsg returns a tea.Cmd that reads one message from the stream
@@ -591,94 +670,3 @@ func waitForStreamMsg(ch <-chan StreamMsg) tea.Cmd {
 	}
 }
 
-// RunClaude spawns claude in print mode with the prompt as an argument.
-// If sessionID is non-empty, uses --resume to continue an existing session.
-// Output is stream-json (NDJSON).
-func RunClaude(prompt, sessionID string) (*ClaudeResponse, error) {
-	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"}
-	if sessionID != "" {
-		args = append(args, "--resume", sessionID)
-	}
-	args = append(args, prompt)
-	cmd := exec.Command("claude", args...)
-
-	// Filter out CLAUDECODE env var
-	env := os.Environ()
-	filtered := make([]string, 0, len(env))
-	for _, e := range env {
-		if !strings.HasPrefix(e, "CLAUDECODE=") {
-			filtered = append(filtered, e)
-		}
-	}
-	cmd.Env = filtered
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	startedAt := time.Now()
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start claude: %w", err)
-	}
-
-	// Read all NDJSON events from stdout
-	var events []StreamEvent
-	var result ClaudeResult
-	var model, stopReason string
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-		var ev StreamEvent
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue
-		}
-		ev.Raw = line
-		ev.ReceivedAt = time.Now()
-		events = append(events, ev)
-
-		switch ev.Type {
-		case "result":
-			json.Unmarshal([]byte(line), &result)
-		case "assistant":
-			var msg struct {
-				Message struct {
-					Model      string `json:"model"`
-					StopReason string `json:"stop_reason"`
-				} `json:"message"`
-			}
-			if json.Unmarshal([]byte(line), &msg) == nil {
-				if msg.Message.Model != "" {
-					model = msg.Message.Model
-				}
-				if msg.Message.StopReason != "" {
-					stopReason = msg.Message.StopReason
-				}
-			}
-		}
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("claude: %w\nstderr: %s", err, stderr.String())
-	}
-
-	return &ClaudeResponse{
-		Command:    cmd.Args,
-		Prompt:     prompt,
-		Events:     events,
-		Result:     result,
-		Stderr:     stderr.String(),
-		Model:      model,
-		StopReason: stopReason,
-		StartedAt:  startedAt,
-	}, nil
-}
