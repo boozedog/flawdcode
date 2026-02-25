@@ -57,14 +57,15 @@ type ClaudeResponse struct {
 	StartedAt  time.Time // when the command was started
 }
 
-// ContentBlock represents a single block in an assistant message (text, tool_use, or tool_result).
+// ContentBlock represents a single block in an assistant message (text, thinking, tool_use, or tool_result).
 type ContentBlock struct {
-	Type    string          `json:"type"`
-	Text    string          `json:"text,omitempty"`
-	ID      string          `json:"id,omitempty"`
-	Name    string          `json:"name,omitempty"`
-	Input   json.RawMessage `json:"input,omitempty"`
-	Content json.RawMessage `json:"content,omitempty"`
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	Thinking string          `json:"thinking,omitempty"`
+	ID       string          `json:"id,omitempty"`
+	Name     string          `json:"name,omitempty"`
+	Input    json.RawMessage `json:"input,omitempty"`
+	Content  json.RawMessage `json:"content,omitempty"`
 }
 
 // ToolResult represents a tool result event.
@@ -82,11 +83,51 @@ type TaskResultMeta struct {
 	TotalToolUseCount int
 }
 
+// PermissionMode controls how Claude CLI handles tool permissions.
+type PermissionMode string
+
+const (
+	PermPlan              PermissionMode = "plan"
+	PermAcceptEdits       PermissionMode = "acceptEdits"
+	PermBypassPermissions PermissionMode = "bypassPermissions"
+	PermDontAsk           PermissionMode = "dontAsk"
+)
+
+// permModes defines the cycling order for permission modes.
+var permModes = []PermissionMode{PermPlan, PermAcceptEdits, PermBypassPermissions, PermDontAsk}
+
+// Next returns the next permission mode in the cycle.
+func (p PermissionMode) Next() PermissionMode {
+	for i, m := range permModes {
+		if m == p {
+			return permModes[(i+1)%len(permModes)]
+		}
+	}
+	return permModes[0]
+}
+
+// Short returns a compact display name for the permission mode.
+func (p PermissionMode) Short() string {
+	switch p {
+	case PermPlan:
+		return "plan"
+	case PermAcceptEdits:
+		return "edits"
+	case PermBypassPermissions:
+		return "bypass"
+	case PermDontAsk:
+		return "yolo"
+	default:
+		return string(p)
+	}
+}
+
 // BlockKind identifies the type of a ChatBlock.
 type BlockKind string
 
 const (
 	BlockText       BlockKind = "text"
+	BlockThinking   BlockKind = "thinking"
 	BlockToolUse    BlockKind = "tool_use"
 	BlockToolResult BlockKind = "tool_result"
 )
@@ -261,6 +302,10 @@ func (r *ClaudeResponse) ExtractBlocks() []ChatBlock {
 			// Top-level assistant event
 			for _, block := range msg.Message.Content {
 				switch block.Type {
+				case "thinking":
+					if block.Thinking != "" {
+						blocks = append(blocks, ChatBlock{Kind: BlockThinking, Text: block.Thinking})
+					}
 				case "text":
 					if block.Text != "" {
 						blocks = append(blocks, ChatBlock{Kind: BlockText, Text: block.Text})
@@ -458,8 +503,11 @@ func WireLogPath() string {
 }
 
 // buildClaudeCmd constructs the exec.Cmd for a claude invocation with args and filtered env.
-func buildClaudeCmd(prompt, sessionID string) *exec.Cmd {
+func buildClaudeCmd(prompt, sessionID string, permMode PermissionMode) *exec.Cmd {
 	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"}
+	if permMode != "" {
+		args = append(args, "--permission-mode", string(permMode))
+	}
 	if sessionID != "" {
 		args = append(args, "--resume", sessionID)
 	}
@@ -517,8 +565,8 @@ func parseEventLine(line string, result *ClaudeResult, model *string, stopReason
 
 // StreamClaude spawns claude in print mode and returns a channel that emits
 // events incrementally. The channel is closed after the final StreamMsg{Done: true}.
-func StreamClaude(prompt, sessionID string) (<-chan StreamMsg, *exec.Cmd, error) {
-	cmd := buildClaudeCmd(prompt, sessionID)
+func StreamClaude(prompt, sessionID string, permMode PermissionMode) (<-chan StreamMsg, *exec.Cmd, error) {
+	cmd := buildClaudeCmd(prompt, sessionID, permMode)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

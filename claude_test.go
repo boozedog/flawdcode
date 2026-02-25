@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -579,6 +580,89 @@ func TestExtractBlocks(t *testing.T) {
 		}
 		if !blocks[1].IsError {
 			t.Error("expected IsError=true on tool_result")
+		}
+	})
+}
+
+func TestPermissionModeNext(t *testing.T) {
+	tests := []struct {
+		name string
+		mode PermissionMode
+		want PermissionMode
+	}{
+		{"plan -> acceptEdits", PermPlan, PermAcceptEdits},
+		{"acceptEdits -> bypassPermissions", PermAcceptEdits, PermBypassPermissions},
+		{"bypassPermissions -> dontAsk", PermBypassPermissions, PermDontAsk},
+		{"dontAsk -> plan (wrap)", PermDontAsk, PermPlan},
+		{"unknown -> plan (fallback)", PermissionMode("unknown"), PermPlan},
+		{"empty -> plan (fallback)", PermissionMode(""), PermPlan},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.mode.Next()
+			if got != tt.want {
+				t.Errorf("Next() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPermissionModeShort(t *testing.T) {
+	tests := []struct {
+		mode PermissionMode
+		want string
+	}{
+		{PermPlan, "plan"},
+		{PermAcceptEdits, "edits"},
+		{PermBypassPermissions, "bypass"},
+		{PermDontAsk, "yolo"},
+		{PermissionMode("custom"), "custom"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.mode), func(t *testing.T) {
+			got := tt.mode.Short()
+			if got != tt.want {
+				t.Errorf("Short() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildClaudeCmdPermissionMode(t *testing.T) {
+	t.Run("includes permission mode", func(t *testing.T) {
+		cmd := buildClaudeCmd("hello", "", PermPlan)
+		args := cmd.Args[1:] // skip "claude" binary
+		idx := slices.Index(args, "--permission-mode")
+		if idx < 0 || idx+1 >= len(args) {
+			t.Fatalf("--permission-mode not found in args: %v", args)
+		}
+		if args[idx+1] != "plan" {
+			t.Errorf("permission mode = %q, want 'plan'", args[idx+1])
+		}
+	})
+
+	t.Run("omits when empty", func(t *testing.T) {
+		cmd := buildClaudeCmd("hello", "", "")
+		args := cmd.Args[1:]
+		if slices.Contains(args, "--permission-mode") {
+			t.Errorf("--permission-mode should not be present for empty mode, args: %v", args)
+		}
+	})
+
+	t.Run("includes session ID", func(t *testing.T) {
+		cmd := buildClaudeCmd("hello", "sess-123", PermAcceptEdits)
+		args := cmd.Args[1:]
+		if !slices.Contains(args, "--resume") {
+			t.Fatalf("--resume not found in args: %v", args)
+		}
+		idx := slices.Index(args, "--resume")
+		if args[idx+1] != "sess-123" {
+			t.Errorf("session ID = %q, want 'sess-123'", args[idx+1])
+		}
+		// Also check permission mode is there
+		pmIdx := slices.Index(args, "--permission-mode")
+		if pmIdx < 0 || args[pmIdx+1] != "acceptEdits" {
+			t.Errorf("permission mode not correct in args: %v", args)
 		}
 	})
 }

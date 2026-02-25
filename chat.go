@@ -20,7 +20,6 @@ import (
 type chatEntry struct {
 	role       string      // "user", "assistant", or "error"
 	text       string      // plain text for user/error; fallback text for assistant
-	thinking   string      // thinking text (persisted after streaming)
 	blocks     []ChatBlock // parsed content blocks for assistant responses
 	result     ClaudeResult
 	model      string
@@ -32,6 +31,12 @@ type chatEntry struct {
 	streaming      bool   // true while being streamed
 	streamThinking string // accumulated thinking text during streaming
 	streamText     string // accumulated raw text during streaming
+}
+
+type cardZone struct {
+	id        string
+	startLine int
+	endLine   int
 }
 
 // ChatModel is the chat tab: viewport (history) + textarea (input) + glamour rendering.
@@ -46,6 +51,7 @@ type ChatModel struct {
 	streamCh      <-chan StreamMsg // current stream channel
 	cachedContent string          // rendered content of all finalized entries
 	scrollMode    bool            // when true, keys go to viewport instead of textarea
+	permMode      PermissionMode  // current permission mode for claude CLI
 
 	// Session-level cumulative stats for status line
 	totalCost      float64
@@ -83,17 +89,29 @@ type ChatModel struct {
 	iStreamCh     <-chan string         // current interactive response stream
 
 	// Cached lipgloss styles (initialized in NewChatModel, updated in SetSize)
-	styleUserLabel     lipgloss.Style
-	styleClaudeLabel   lipgloss.Style
-	styleErrLabel      lipgloss.Style
+	styleUserCard      lipgloss.Style
+	styleErrorCard     lipgloss.Style
+	styleToolResultCard lipgloss.Style
 	styleDim           lipgloss.Style
 	styleToolName      lipgloss.Style
-	styleToolBorder    lipgloss.Style
 	styleToolInput     lipgloss.Style
 	styleToolOutput    lipgloss.Style
 	styleToolErr       lipgloss.Style
-	styleThinking      lipgloss.Style
+	styleUserLabel     lipgloss.Style
+	styleThinkingCard  lipgloss.Style
 	styleThinkingLabel lipgloss.Style
+	styleHeaderCard    lipgloss.Style
+	styleAssistantCard lipgloss.Style
+	styleToolCard      lipgloss.Style
+
+	// Layout padding
+	padH int // horizontal padding (each side)
+
+	// Collapsible card state
+	expandedCards      map[string]bool // card ID → expanded
+	cardZones          []cardZone      // rebuilt each render
+	cachedCardZoneCount int            // zones from finalized entries
+	cachedLineCount    int             // line count of cached content
 }
 
 // NewChatModel creates a new chat tab model.
@@ -110,7 +128,7 @@ func NewChatModel() *ChatModel {
 
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStandardStyle(styles.DarkStyle),
-		glamour.WithWordWrap(76),
+		glamour.WithWordWrap(73),
 	)
 	if err != nil {
 		log.Printf("glamour renderer init failed: %v (markdown rendering disabled)", err)
@@ -120,40 +138,70 @@ func NewChatModel() *ChatModel {
 		viewport: vp,
 		textarea: ta,
 		renderer: r,
-		styleUserLabel: lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("15")).
-			Background(lipgloss.Color("4")).
-			Padding(0, 1),
-		styleClaudeLabel: lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("15")).
-			Background(lipgloss.Color("208")).
-			Padding(0, 1),
-		styleErrLabel: lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("15")).
-			Background(lipgloss.Color("1")).
-			Padding(0, 1),
+		permMode: PermAcceptEdits,
+		styleUserCard: lipgloss.NewStyle().
+			BorderLeft(true).
+			BorderStyle(lipgloss.ThickBorder()).
+			BorderForeground(lipgloss.Color("4")).
+			Background(lipgloss.Color("236")).
+			PaddingLeft(1).
+			PaddingRight(1),
+		styleErrorCard: lipgloss.NewStyle().
+			BorderLeft(true).
+			BorderStyle(lipgloss.ThickBorder()).
+			BorderForeground(lipgloss.Color("1")).
+			Background(lipgloss.Color("236")).
+			PaddingLeft(1).
+			PaddingRight(1),
+		styleToolResultCard: lipgloss.NewStyle().
+			Background(lipgloss.Color("235")).
+			PaddingLeft(1).
+			PaddingRight(1),
 		styleDim: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8")),
 		styleToolName: lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("3")),
-		styleToolBorder: lipgloss.NewStyle().
-			Foreground(lipgloss.Color("8")),
 		styleToolInput: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("6")),
 		styleToolOutput: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("7")),
 		styleToolErr: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("9")),
-		styleThinking: lipgloss.NewStyle().
-			Foreground(lipgloss.Color("8")).
+		styleUserLabel: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("4")).
+			Background(lipgloss.Color("236")).
+			Bold(true),
+		styleThinkingCard: lipgloss.NewStyle().
+			BorderLeft(true).
+			BorderStyle(lipgloss.ThickBorder()).
+			BorderForeground(lipgloss.Color("243")).
+			Background(lipgloss.Color("236")).
+			PaddingLeft(1).
+			PaddingRight(1).
+			Foreground(lipgloss.Color("243")).
 			Italic(true),
 		styleThinkingLabel: lipgloss.NewStyle().
-			Foreground(lipgloss.Color("8")).
-			Bold(true),
+			Foreground(lipgloss.Color("243")).
+			Background(lipgloss.Color("236")).
+			Bold(true).
+			Italic(true),
+		styleHeaderCard: lipgloss.NewStyle().
+			Background(lipgloss.Color("236")).
+			PaddingLeft(1).
+			PaddingRight(1),
+		styleAssistantCard: lipgloss.NewStyle().
+			BorderLeft(true).
+			BorderStyle(lipgloss.ThickBorder()).
+			BorderForeground(lipgloss.Color("208")).
+			PaddingLeft(1),
+		styleToolCard: lipgloss.NewStyle().
+			BorderLeft(true).
+			BorderStyle(lipgloss.ThickBorder()).
+			BorderForeground(lipgloss.Color("3")).
+			PaddingLeft(1),
+		padH:          2,
+		expandedCards: make(map[string]bool),
 	}
 }
 
@@ -190,6 +238,10 @@ func (m *ChatModel) Update(msg tea.Msg) tea.Cmd {
 			return cmd
 		}
 
+		if msg.String() == "ctrl+p" {
+			m.permMode = m.permMode.Next()
+			return nil
+		}
 		if msg.String() == "shift+enter" {
 			m.textarea.InsertRune('\n')
 			return nil
@@ -221,8 +273,9 @@ func (m *ChatModel) Update(msg tea.Msg) tea.Cmd {
 				} else {
 					// Print mode: spawn new process per message
 					sid := m.sessionID
+					pm := m.permMode
 					cmds = append(cmds, func() tea.Msg {
-						ch, cmd, err := StreamClaude(text, sid)
+						ch, cmd, err := StreamClaude(text, sid, pm)
 						if err != nil {
 							return ClaudeStreamDoneMsg{Prompt: text, Err: err}
 						}
@@ -265,6 +318,12 @@ func (m *ChatModel) Update(msg tea.Msg) tea.Cmd {
 				// Apply deltas to the appropriate block
 				if msg.ThinkingDelta != "" {
 					last.streamThinking += msg.ThinkingDelta
+					// Append to last thinking block, auto-create if none
+					if idx := lastBlockIndex(last.blocks, BlockThinking); idx >= 0 {
+						last.blocks[idx].Text += msg.ThinkingDelta
+					} else {
+						last.blocks = append(last.blocks, ChatBlock{Kind: BlockThinking, Text: msg.ThinkingDelta})
+					}
 				}
 				if msg.TextDelta != "" {
 					last.streamText += msg.TextDelta
@@ -307,7 +366,6 @@ func (m *ChatModel) Update(msg tea.Msg) tea.Cmd {
 				last := &m.entries[len(m.entries)-1]
 				last.streaming = false
 				last.text = last.streamText
-				last.thinking = last.streamThinking
 				last.result = msg.Response.Result
 				last.model = msg.Response.Model
 				last.stopReason = msg.Response.StopReason
@@ -425,9 +483,29 @@ func (m *ChatModel) Update(msg tea.Msg) tea.Cmd {
 		return nil
 	}
 
-	// Route mouse wheel to viewport, everything else to textarea only
+	// Route mouse events to appropriate handlers
 	var cmd tea.Cmd
-	switch msg.(type) {
+	switch msg := msg.(type) {
+	case tea.MouseClickMsg:
+		if msg.Button == tea.MouseLeft {
+			const headerLines = 2 // header card + blank line
+			vpHeight := m.viewport.Height()
+			vpY := msg.Y - headerLines
+			if vpY >= 0 && vpY < vpHeight {
+				contentLine := vpY + m.viewport.YOffset()
+				for _, zone := range m.cardZones {
+					if contentLine >= zone.startLine && contentLine <= zone.endLine {
+						if m.expandedCards[zone.id] {
+							delete(m.expandedCards, zone.id)
+						} else {
+							m.expandedCards[zone.id] = true
+						}
+						m.refreshViewport()
+						break
+					}
+				}
+			}
+		}
 	case tea.MouseWheelMsg:
 		m.viewport, cmd = m.viewport.Update(msg)
 		if cmd != nil {
@@ -503,18 +581,23 @@ func (m *ChatModel) updateSessionStats(resp *ClaudeResponse) {
 func (m *ChatModel) SetSize(w, h int) {
 	m.width = w
 	m.height = h
-	textareaHeight := 3
-	// 1 for divider, 1 for status line
-	viewportHeight := h - textareaHeight - 2
 
-	m.viewport.SetWidth(w)
+	innerW := w - m.padH*2
+	if innerW < 20 {
+		innerW = 20
+	}
+	textareaHeight := 3
+	// 1 header + 1 blank line below header + 1 divider + 1 status line
+	viewportHeight := h - textareaHeight - 4
+
+	m.viewport.SetWidth(innerW)
 	m.viewport.SetHeight(viewportHeight)
-	m.textarea.SetWidth(w)
+	m.textarea.SetWidth(innerW)
 	m.textarea.SetHeight(textareaHeight)
 
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStandardStyle(styles.DarkStyle),
-		glamour.WithWordWrap(w-4),
+		glamour.WithWordWrap(innerW-7),
 	)
 	if err == nil {
 		m.renderer = r
@@ -524,6 +607,16 @@ func (m *ChatModel) SetSize(w, h int) {
 
 // View renders the chat tab.
 func (m *ChatModel) View() string {
+	innerW := m.width - m.padH*2
+	if innerW < 20 {
+		innerW = 20
+	}
+	pad := strings.Repeat(" ", m.padH)
+
+	// Sticky header card
+	header := m.renderHeaderCard(innerW)
+
+	// Divider between viewport and textarea
 	var divider string
 	if m.scrollMode {
 		scrollStyle := lipgloss.NewStyle().
@@ -532,23 +625,44 @@ func (m *ChatModel) View() string {
 			Background(lipgloss.Color("3"))
 		pct := int(m.viewport.ScrollPercent() * 100)
 		label := fmt.Sprintf(" SCROLL (esc to exit) %d%% ", pct)
-		pad := m.width - lipgloss.Width(label)
-		if pad < 0 {
-			pad = 0
+		labelW := lipgloss.Width(label)
+		lineW := innerW - labelW
+		if lineW < 0 {
+			lineW = 0
 		}
 		divider = scrollStyle.Render(label) + lipgloss.NewStyle().
 			Foreground(lipgloss.Color("3")).
-			Render(strings.Repeat("─", pad))
+			Render(strings.Repeat("─", lineW))
 	} else {
+		hint := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Render(fmt.Sprintf(" ctrl+p: %s ", m.permMode.Short()))
+		hintW := lipgloss.Width(hint)
+		lineW := innerW - hintW
+		if lineW < 0 {
+			lineW = 0
+		}
 		divider = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8")).
-			Render(strings.Repeat("─", m.width))
+			Render(strings.Repeat("─", lineW)) + hint
 	}
 
-	return fmt.Sprintf("%s\n%s\n%s\n%s",
+	// Indent every line with horizontal padding
+	body := fmt.Sprintf("%s\n\n%s\n%s\n%s\n%s",
+		header,
 		m.viewport.View(),
 		m.renderStatusLine(),
 		divider,
 		m.textarea.View(),
 	)
+
+	var sb strings.Builder
+	for i, line := range strings.Split(body, "\n") {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(pad)
+		sb.WriteString(line)
+	}
+	return sb.String()
 }

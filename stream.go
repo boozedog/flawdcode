@@ -90,6 +90,8 @@ func (m *ChatModel) parseStreamBlock(entry *chatEntry, ev StreamEvent) {
 		}
 		if json.Unmarshal([]byte(ev.Raw), &wrapper) == nil && wrapper.Event.Type == "content_block_start" {
 			switch wrapper.Event.ContentBlock.Type {
+			case "thinking":
+				entry.blocks = append(entry.blocks, ChatBlock{Kind: BlockThinking})
 			case "text":
 				entry.blocks = append(entry.blocks, ChatBlock{Kind: BlockText})
 			case "tool_use":
@@ -145,6 +147,8 @@ func (m *ChatModel) addContentBlock(entry *chatEntry, raw string) {
 	}
 	if json.Unmarshal([]byte(raw), &cbs) == nil {
 		switch cbs.ContentBlock.Type {
+		case "thinking":
+			entry.blocks = append(entry.blocks, ChatBlock{Kind: BlockThinking})
 		case "text":
 			entry.blocks = append(entry.blocks, ChatBlock{Kind: BlockText})
 		case "tool_use":

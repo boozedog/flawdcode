@@ -7,77 +7,82 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-func (m *ChatModel) refreshViewport() {
-	var sb strings.Builder
+const maxCollapsedLines = 5
 
-	contentWidth := m.width - 4
+func (m *ChatModel) refreshViewport() {
+	m.cardZones = m.cardZones[:0]
+	var sb strings.Builder
+	var lineCount int
+
+	innerW := m.width - m.padH*2
+	if innerW < 20 {
+		innerW = 20
+	}
+	contentWidth := innerW - 4
 	if contentWidth < 20 {
 		contentWidth = 20
 	}
-
-	separator := m.styleDim.Render(strings.Repeat("─", m.width))
+	cardWidth := contentWidth
+	if cardWidth < 20 {
+		cardWidth = 20
+	}
 
 	// Init banner
 	if m.initReceived {
-		m.renderInitBanner(&sb)
+		m.renderInitBanner(&sb, &lineCount)
 	}
 
 	for i, e := range m.entries {
 		if i > 0 {
-			sb.WriteString("\n" + separator + "\n\n")
+			sb.WriteString("\n")
+			lineCount++
 		}
 
 		switch e.role {
 		case "user":
-			sb.WriteString(m.styleUserLabel.Render("YOU"))
-			sb.WriteString("\n\n")
-			sb.WriteString(e.text)
-			sb.WriteString("\n")
+			id := fmt.Sprintf("entry-%d", i)
+			m.renderCard(&sb, &lineCount, id,
+				m.styleUserLabel.Render("User:")+"\n"+e.text,
+				m.styleUserCard, cardWidth, false)
 
 		case "assistant":
-			sb.WriteString(m.styleClaudeLabel.Render("CLAUDE"))
-			sb.WriteString("\n")
-
-			// Render thinking if present
-			if e.thinking != "" {
-				sb.WriteString("\n")
-				sb.WriteString(m.styleThinkingLabel.Render("  Thinking"))
-				sb.WriteString("\n")
-				sb.WriteString(m.styleThinking.Render("  " + strings.ReplaceAll(e.thinking, "\n", "\n  ")))
-				sb.WriteString("\n")
-			}
-
 			if len(e.blocks) > 0 {
-				m.renderBlocks(&sb, e.blocks, contentWidth, false)
+				m.renderBlocks(&sb, e.blocks, contentWidth, false, i, &lineCount)
 			} else if e.text != "" {
-				sb.WriteString("\n")
+				brightWhite := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+				var displayText string
 				if m.renderer != nil {
 					rendered, err := m.renderer.Render(e.text)
 					if err == nil {
-						sb.WriteString(strings.TrimSpace(rendered))
+						displayText = strings.TrimSpace(rendered)
 					} else {
-						sb.WriteString(e.text)
+						displayText = brightWhite.Render(e.text)
 					}
 				} else {
-					sb.WriteString(e.text)
+					displayText = brightWhite.Render(e.text)
 				}
-				sb.WriteString("\n")
+				id := fmt.Sprintf("text-%d", i)
+				m.renderCard(&sb, &lineCount, id, displayText,
+					m.styleAssistantCard, cardWidth, false)
 			}
 
 			// Per-message metadata line
 			if e.hasResult {
-				sb.WriteString(m.renderMessageMeta(e))
+				meta := m.renderMessageMeta(e)
+				sb.WriteString(meta)
+				lineCount += strings.Count(meta, "\n")
 			}
 
 		case "error":
-			sb.WriteString(m.styleErrLabel.Render("ERROR"))
-			sb.WriteString("\n\n")
-			sb.WriteString(e.text)
-			sb.WriteString("\n")
+			id := fmt.Sprintf("entry-%d", i)
+			m.renderCard(&sb, &lineCount, id, e.text,
+				m.styleErrorCard, cardWidth, false)
 		}
 	}
 
 	m.cachedContent = sb.String()
+	m.cachedCardZoneCount = len(m.cardZones)
+	m.cachedLineCount = lineCount
 	wasAtBottom := m.viewport.AtBottom()
 	m.viewport.SetContent(m.cachedContent)
 	if wasAtBottom {
@@ -85,25 +90,56 @@ func (m *ChatModel) refreshViewport() {
 	}
 }
 
+// renderCard renders content inside a styled card, with collapsible truncation.
+// Cards longer than maxCollapsedLines are truncated unless expanded or forceExpanded.
+func (m *ChatModel) renderCard(sb *strings.Builder, lineCount *int, id, content string,
+	style lipgloss.Style, width int, forceExpanded bool,
+) {
+	startLine := *lineCount
+	rendered := style.Width(width).Render(content)
+	lines := strings.Split(rendered, "\n")
+
+	expanded := forceExpanded || m.expandedCards[id]
+	if !expanded && len(lines) > maxCollapsedLines {
+		ellipsis := style.Width(width).Render(m.styleDim.Render("…"))
+		ellipsisLine := strings.Split(ellipsis, "\n")[0]
+		lines = append(lines[:maxCollapsedLines-1], ellipsisLine)
+	}
+
+	sb.WriteString(strings.Join(lines, "\n"))
+	sb.WriteByte('\n')
+	*lineCount += len(lines)
+
+	endLine := *lineCount - 1
+	m.cardZones = append(m.cardZones, cardZone{id: id, startLine: startLine, endLine: endLine})
+}
+
 // refreshStreamingViewport efficiently updates the viewport during streaming.
 // It reuses the cached content for finalized entries and renders the streaming
 // entry's blocks without glamour rendering.
 func (m *ChatModel) refreshStreamingViewport() {
-	contentWidth := m.width - 4
+	// Preserve zones from finalized entries, discard streaming zones
+	m.cardZones = m.cardZones[:m.cachedCardZoneCount]
+
+	innerW := m.width - m.padH*2
+	if innerW < 20 {
+		innerW = 20
+	}
+	contentWidth := innerW - 4
 	if contentWidth < 20 {
 		contentWidth = 20
 	}
 
-	separator := m.styleDim.Render(strings.Repeat("─", m.width))
-
 	var sb strings.Builder
+	var lineCount int
 
 	// Init banner if no cached content yet
 	if m.cachedContent == "" && m.initReceived {
-		m.renderInitBanner(&sb)
+		m.renderInitBanner(&sb, &lineCount)
 	} else {
 		// Use cached content for all finalized entries
 		sb.WriteString(m.cachedContent)
+		lineCount = m.cachedLineCount
 	}
 
 	// Append the streaming entry
@@ -111,24 +147,17 @@ func (m *ChatModel) refreshStreamingViewport() {
 		last := &m.entries[len(m.entries)-1]
 		if last.streaming {
 			if sb.Len() > 0 {
-				sb.WriteString("\n" + separator + "\n\n")
-			}
-			sb.WriteString(m.styleClaudeLabel.Render("CLAUDE"))
-			sb.WriteString("\n")
-
-			if last.streamThinking != "" {
 				sb.WriteString("\n")
-				sb.WriteString(m.styleThinkingLabel.Render("  Thinking..."))
-				sb.WriteString("\n")
-				sb.WriteString(m.styleThinking.Render("  " + strings.ReplaceAll(last.streamThinking, "\n", "\n  ")))
-				sb.WriteString("\n")
+				lineCount++
 			}
 
-			// Render blocks incrementally (raw=true skips glamour)
+			// Render blocks incrementally (raw=true skips glamour, forces expanded)
 			if len(last.blocks) > 0 {
-				m.renderBlocks(&sb, last.blocks, contentWidth, true)
+				entryIdx := len(m.entries) - 1
+				m.renderBlocks(&sb, last.blocks, contentWidth, true, entryIdx, &lineCount)
 			}
 			sb.WriteString("\n")
+			lineCount++
 		}
 	}
 
@@ -140,7 +169,7 @@ func (m *ChatModel) refreshStreamingViewport() {
 }
 
 func (m *ChatModel) renderBlocks(sb *strings.Builder, blocks []ChatBlock,
-	contentWidth int, raw bool,
+	contentWidth int, raw bool, entryIdx int, lineCount *int,
 ) {
 	// Group tool_use and tool_result by ToolID for inline rendering
 	resultMap := make(map[string]*ChatBlock)
@@ -150,88 +179,74 @@ func (m *ChatModel) renderBlocks(sb *strings.Builder, blocks []ChatBlock,
 		}
 	}
 
-	for _, block := range blocks {
+	for blockIdx, block := range blocks {
 		switch block.Kind {
+		case BlockThinking:
+			if block.Text == "" {
+				continue
+			}
+			cardWidth := contentWidth
+			if cardWidth < 20 {
+				cardWidth = 20
+			}
+			label := m.styleThinkingLabel.Render("Thinking:")
+			if raw {
+				label = m.styleThinkingLabel.Render("Thinking ...")
+			}
+			id := fmt.Sprintf("block-%d-%d", entryIdx, blockIdx)
+			m.renderCard(sb, lineCount, id, label+"\n"+block.Text,
+				m.styleThinkingCard, cardWidth, raw)
+			sb.WriteString("\n")
+			*lineCount++
+
 		case BlockText:
 			if block.Text == "" {
 				continue
 			}
-			sb.WriteString("\n")
+			cardWidth := contentWidth
+			if cardWidth < 20 {
+				cardWidth = 20
+			}
+			brightWhite := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+			var displayText string
 			if !raw && m.renderer != nil {
 				rendered, err := m.renderer.Render(block.Text)
 				if err == nil {
-					sb.WriteString(strings.TrimSpace(rendered))
+					displayText = strings.TrimSpace(rendered)
 				} else {
-					sb.WriteString(block.Text)
+					displayText = brightWhite.Render(block.Text)
 				}
 			} else {
-				sb.WriteString(block.Text)
+				displayText = brightWhite.Render(block.Text)
 			}
+			id := fmt.Sprintf("text-%d-%d", entryIdx, blockIdx)
+			m.renderCard(sb, lineCount, id, displayText,
+				m.styleAssistantCard, cardWidth, raw)
 			sb.WriteString("\n")
+			*lineCount++
 
 		case BlockToolUse:
-			sb.WriteString("\n")
-
+			cardWidth := contentWidth
+			if cardWidth < 20 {
+				cardWidth = 20
+			}
+			// Render tool content to buffer, then wrap in card
+			innerWidth := contentWidth - 3 // account for card border + padding
+			if innerWidth < 20 {
+				innerWidth = 20
+			}
+			var toolBuf strings.Builder
 			if block.IsTask {
-				m.renderTaskBlock(sb, block, resultMap[block.ToolID], contentWidth)
-				continue
+				m.renderTaskBlock(&toolBuf, block, resultMap[block.ToolID], innerWidth)
+			} else {
+				m.renderCompactTool(&toolBuf, block, resultMap[block.ToolID], innerWidth)
 			}
-
-			// Compact rendering for Read tool calls
-			if block.ToolName == "Read" {
-				m.renderCompactTool(sb, block, resultMap[block.ToolID], contentWidth)
-				continue
-			}
-
-			boxWidth := contentWidth - 2
-			if boxWidth < 20 {
-				boxWidth = 20
-			}
-
-			header := fmt.Sprintf("┌─ %s %s", m.styleToolName.Render("⚙ "+block.ToolName),
-				m.styleToolBorder.Render(strings.Repeat("─", max(0, boxWidth-len(block.ToolName)-6))))
-			sb.WriteString(m.styleToolBorder.Render("  ") + header + "\n")
-
-			// Tool input
-			inputLines := strings.Split(block.ToolInput, "\n")
-			for _, line := range inputLines {
-				line = truncateRunes(line, boxWidth-4)
-				sb.WriteString(m.styleToolBorder.Render("  │ ") + m.styleToolInput.Render(line) + "\n")
-			}
-
-			// Tool result (if matched)
-			if result, ok := resultMap[block.ToolID]; ok {
-				sb.WriteString(m.styleToolBorder.Render("  ├─ "))
-				if result.IsError {
-					sb.WriteString(m.styleToolErr.Render("✗ Error") + "\n")
-				} else {
-					sb.WriteString(m.styleDim.Render("✓ Result") + "\n")
-				}
-
-				output := result.ToolOutput
-				outputLines := strings.Split(output, "\n")
-				maxLines := 15
-				truncated := false
-				if len(outputLines) > maxLines {
-					outputLines = outputLines[:maxLines]
-					truncated = true
-				}
-				for _, line := range outputLines {
-					line = truncateRunes(line, boxWidth-4)
-					style := m.styleToolOutput
-					if result.IsError {
-						style = m.styleToolErr
-					}
-					sb.WriteString(m.styleToolBorder.Render("  │ ") + style.Render(line) + "\n")
-				}
-				if truncated {
-					sb.WriteString(m.styleToolBorder.Render("  │ ") + m.styleDim.Render(fmt.Sprintf("... (%d more lines)", len(strings.Split(output, "\n"))-maxLines)) + "\n")
-				}
-			}
-
-			// Close box
-			footer := fmt.Sprintf("└%s", strings.Repeat("─", max(0, boxWidth)))
-			sb.WriteString(m.styleToolBorder.Render("  "+footer) + "\n")
+			id := fmt.Sprintf("tool-%d-%d", entryIdx, blockIdx)
+			m.renderCard(sb, lineCount, id,
+				strings.TrimRight(toolBuf.String(), "\n"),
+				m.styleToolCard, cardWidth, false)
+			sb.WriteString("\n")
+			*lineCount++
 
 		case BlockToolResult:
 			continue
@@ -274,7 +289,7 @@ func (m *ChatModel) renderMessageMeta(e chatEntry) string {
 }
 
 // renderInitBanner writes the init banner (model, version, tools, plugins) to sb.
-func (m *ChatModel) renderInitBanner(sb *strings.Builder) {
+func (m *ChatModel) renderInitBanner(sb *strings.Builder, lineCount *int) {
 	var info []string
 	if m.initModel != "" {
 		info = append(info, m.initModel)
@@ -291,8 +306,10 @@ func (m *ChatModel) renderInitBanner(sb *strings.Builder) {
 	for _, p := range m.initPlugins {
 		info = append(info, p)
 	}
-	sb.WriteString(m.styleDim.Render("  " + strings.Join(info, " · ")))
+	text := m.styleDim.Render("  " + strings.Join(info, " · "))
+	sb.WriteString(text)
 	sb.WriteString("\n\n")
+	*lineCount += strings.Count(text, "\n") + 2
 }
 
 // renderStatusLine builds the persistent status line below the textarea.
@@ -300,15 +317,20 @@ func (m *ChatModel) renderStatusLine() string {
 	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	sepStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 
+	permStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
+
 	if m.totalRequests == 0 && m.initReceived {
 		info := m.initModel + " ready"
-		return dimStyle.Render(info)
+		return permStyle.Render(string(m.permMode)) + sepStyle.Render(" │ ") + dimStyle.Render(info)
 	} else if m.totalRequests == 0 {
-		return dimStyle.Render("ready")
+		return permStyle.Render(string(m.permMode)) + sepStyle.Render(" │ ") + dimStyle.Render("ready")
 	}
 
 	sep := sepStyle.Render(" │ ")
 	var parts []string
+
+	// Permission mode (first item, magenta)
+	parts = append(parts, permStyle.Render(string(m.permMode)))
 
 	// Model name (short form)
 	model := m.lastModel
@@ -351,11 +373,42 @@ func (m *ChatModel) renderStatusLine() string {
 	return strings.Join(parts, sep)
 }
 
-// renderCompactTool renders a tool call in the compact subagent-activity style:
+// shouldShowResultCard returns true if the tool result should be rendered
+// as a dark-background card instead of a one-line summary.
+func shouldShowResultCard(toolName, output string) bool {
+	return toolName == "Bash" && strings.Contains(output, "\n")
+}
+
+// renderToolResultCard renders truncated tool output in a dark background card.
+// The card spans nearly full content width, like opencode's output cards.
+func (m *ChatModel) renderToolResultCard(sb *strings.Builder, output string, contentWidth int) {
+	lines := strings.Split(output, "\n")
+	maxLines := 15
+	truncated := false
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+		truncated = true
+	}
+	for i, line := range lines {
+		lines[i] = truncateRunes(line, contentWidth-4)
+	}
+	cardContent := strings.Join(lines, "\n")
+	if truncated {
+		totalLines := len(strings.Split(output, "\n"))
+		cardContent += "\n" + m.styleDim.Render(fmt.Sprintf("... (%d more lines)", totalLines-maxLines))
+	}
+	cardWidth := contentWidth
+	if cardWidth < 20 {
+		cardWidth = 20
+	}
+	sb.WriteString(m.styleToolResultCard.Width(cardWidth).Render(cardContent) + "\n")
+}
+
+// renderCompactTool renders a tool call in the compact style:
 //
-//	⚙ Read
-//	  /path/to/file
-//	  ✓ package main
+//	⚙ ToolName
+//	  input summary
+//	  ✓ first line of result
 func (m *ChatModel) renderCompactTool(sb *strings.Builder, block ChatBlock, result *ChatBlock,
 	contentWidth int,
 ) {
@@ -364,20 +417,22 @@ func (m *ChatModel) renderCompactTool(sb *strings.Builder, block ChatBlock, resu
 		maxLen = 20
 	}
 
-	sb.WriteString("  " + m.styleToolName.Render("⚙ "+block.ToolName) + "\n")
-
-	// Input summary
+	// Tool name + input summary on the same line
 	inputLine := toolInputSummary(block.ToolName, block.ToolInput, maxLen)
 	if inputLine != "" {
-		sb.WriteString("    " + m.styleToolInput.Render(inputLine) + "\n")
+		sb.WriteString("  " + m.styleToolName.Render("⚙ "+block.ToolName) + " " + m.styleToolInput.Render(inputLine) + "\n")
+	} else {
+		sb.WriteString("  " + m.styleToolName.Render("⚙ "+block.ToolName) + "\n")
 	}
 
-	// Result summary
+	// Result
 	if result != nil {
 		if result.IsError {
 			cleaned := cleanToolOutput(result.ToolOutput)
 			outputLine := firstLine(cleaned, maxLen-4)
 			sb.WriteString("    " + m.styleToolErr.Render("✗ "+outputLine) + "\n")
+		} else if shouldShowResultCard(block.ToolName, result.ToolOutput) {
+			m.renderToolResultCard(sb, result.ToolOutput, contentWidth)
 		} else {
 			cleaned := cleanToolOutput(result.ToolOutput)
 			outputLine := firstLine(cleaned, maxLen-4)
@@ -386,13 +441,14 @@ func (m *ChatModel) renderCompactTool(sb *strings.Builder, block ChatBlock, resu
 	}
 }
 
-// renderTaskBlock renders a Task (subagent) tool call with header, subagent activity, result, and metadata footer.
+// renderTaskBlock renders a Task (subagent) tool call with compact header,
+// description, subagent activity, result, and metadata footer.
 func (m *ChatModel) renderTaskBlock(sb *strings.Builder, block ChatBlock, result *ChatBlock,
 	contentWidth int,
 ) {
-	boxWidth := contentWidth - 2
-	if boxWidth < 20 {
-		boxWidth = 20
+	maxLen := contentWidth - 6
+	if maxLen < 20 {
+		maxLen = 20
 	}
 
 	// Header with subagent type
@@ -400,21 +456,17 @@ func (m *ChatModel) renderTaskBlock(sb *strings.Builder, block ChatBlock, result
 	if label == "" {
 		label = "Task"
 	}
-	header := fmt.Sprintf("┌─ %s %s", m.styleToolName.Render("⚙ "+label),
-		m.styleToolBorder.Render(strings.Repeat("─", max(0, boxWidth-len(label)-6))))
-	sb.WriteString(m.styleToolBorder.Render("  ") + header + "\n")
+	sb.WriteString("  " + m.styleToolName.Render("⚙ "+label) + "\n")
 
-	// Description field
-	renderTaskField(sb, "desc", block.TaskDescription, boxWidth, m.styleToolBorder, m.styleToolInput)
-
-	// Prompt field (with wrapping)
-	if block.TaskPrompt != "" {
-		renderTaskField(sb, "prompt", block.TaskPrompt, boxWidth, m.styleToolBorder, m.styleToolInput)
+	// Description (one-liner, indented)
+	if block.TaskDescription != "" {
+		desc := truncateRunes(block.TaskDescription, maxLen)
+		sb.WriteString("    " + m.styleToolInput.Render(desc) + "\n")
 	}
 
-	// Subagent activity
+	// Subagent activity (nested compact tool calls)
 	if len(block.TaskSubBlocks) > 0 {
-		sb.WriteString(m.styleToolBorder.Render("  ├─ ") + m.styleDim.Render("Subagent Activity") + "\n")
+		sb.WriteString("    " + m.styleDim.Render("Activity:") + "\n")
 
 		// Build result map for sub-blocks
 		subResultMap := make(map[string]*ChatBlock)
@@ -424,14 +476,19 @@ func (m *ChatModel) renderTaskBlock(sb *strings.Builder, block ChatBlock, result
 			}
 		}
 
+		subMaxLen := maxLen - 4
+		if subMaxLen < 20 {
+			subMaxLen = 20
+		}
+
 		for _, sub := range block.TaskSubBlocks {
 			if sub.Kind == BlockToolUse {
-				sb.WriteString(m.styleToolBorder.Render("  │  ") + m.styleToolName.Render("⚙ "+sub.ToolName) + "\n")
-
-				// Show meaningful summary of input
-				inputLine := toolInputSummary(sub.ToolName, sub.ToolInput, boxWidth-8)
+					// Tool name + input on same line
+				inputLine := toolInputSummary(sub.ToolName, sub.ToolInput, subMaxLen)
 				if inputLine != "" {
-					sb.WriteString(m.styleToolBorder.Render("  │    ") + m.styleToolInput.Render(inputLine) + "\n")
+					sb.WriteString("      " + m.styleToolName.Render("⚙ "+sub.ToolName) + " " + m.styleToolInput.Render(inputLine) + "\n")
+				} else {
+					sb.WriteString("      " + m.styleToolName.Render("⚙ "+sub.ToolName) + "\n")
 				}
 
 				// Show first line of result
@@ -443,40 +500,23 @@ func (m *ChatModel) renderTaskBlock(sb *strings.Builder, block ChatBlock, result
 						style = m.styleToolErr
 					}
 					cleaned := cleanToolOutput(res.ToolOutput)
-					outputLine := firstLine(cleaned, boxWidth-10)
-					sb.WriteString(m.styleToolBorder.Render("  │    ") + style.Render(marker+" "+outputLine) + "\n")
+					outputLine := firstLine(cleaned, subMaxLen-4)
+					sb.WriteString("        " + style.Render(marker+" "+outputLine) + "\n")
 				}
 			}
 		}
 	}
 
-	// Result (from the tool_result block)
+	// Result
 	if result != nil {
-		sb.WriteString(m.styleToolBorder.Render("  ├─ "))
 		if result.IsError {
-			sb.WriteString(m.styleToolErr.Render("✗ Error") + "\n")
+			cleaned := cleanToolOutput(result.ToolOutput)
+			outputLine := firstLine(cleaned, maxLen-4)
+			sb.WriteString("    " + m.styleToolErr.Render("✗ "+outputLine) + "\n")
 		} else {
-			sb.WriteString(m.styleDim.Render("✓ Result") + "\n")
-		}
-
-		output := result.ToolOutput
-		outputLines := strings.Split(output, "\n")
-		maxLines := 15
-		truncated := false
-		if len(outputLines) > maxLines {
-			outputLines = outputLines[:maxLines]
-			truncated = true
-		}
-		for _, line := range outputLines {
-			line = truncateRunes(line, boxWidth-4)
-			style := m.styleToolOutput
-			if result.IsError {
-				style = m.styleToolErr
-			}
-			sb.WriteString(m.styleToolBorder.Render("  │ ") + style.Render(line) + "\n")
-		}
-		if truncated {
-			sb.WriteString(m.styleToolBorder.Render("  │ ") + m.styleDim.Render(fmt.Sprintf("... (%d more lines)", len(strings.Split(output, "\n"))-maxLines)) + "\n")
+			cleaned := cleanToolOutput(result.ToolOutput)
+			outputLine := firstLine(cleaned, maxLen-4)
+			sb.WriteString("    " + m.styleDim.Render("✓ "+outputLine) + "\n")
 		}
 	}
 
@@ -501,52 +541,68 @@ func (m *ChatModel) renderTaskBlock(sb *strings.Builder, block ChatBlock, result
 			metaParts = append(metaParts, fmt.Sprintf("%d tools", meta.TotalToolUseCount))
 		}
 		if len(metaParts) > 0 {
-			sb.WriteString(m.styleToolBorder.Render("  ├─ ") + m.styleDim.Render(strings.Join(metaParts, " · ")) + "\n")
+			sb.WriteString("    " + m.styleDim.Render(strings.Join(metaParts, " · ")) + "\n")
 		}
 	}
-
-	// Close box
-	footer := fmt.Sprintf("└%s", strings.Repeat("─", max(0, boxWidth)))
-	sb.WriteString(m.styleToolBorder.Render("  "+footer) + "\n")
 }
 
-// renderTaskField renders a labeled field with text wrapping inside a tool box.
-// Long values are truncated after maxFieldLines lines.
-func renderTaskField(sb *strings.Builder, label, value string, boxWidth int,
-	borderStyle, valueStyle lipgloss.Style) {
-	if value == "" {
-		return
-	}
-	prefix := label + ":"
-	padLen := 9 - len(prefix)
-	if padLen < 1 {
-		padLen = 1
-	}
-	prefix += strings.Repeat(" ", padLen)
+// renderHeaderCard renders the sticky header card showing conversation topic and stats.
+func (m *ChatModel) renderHeaderCard(innerW int) string {
+	topic := m.conversationTopic()
+	titleStyle := lipgloss.NewStyle().Bold(true)
+	statsStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 
-	// Wrap text within box width
-	wrapWidth := boxWidth - len(prefix) - 4
-	if wrapWidth < 20 {
-		wrapWidth = 20
+	// Build stats: total tokens, cache%, cost
+	var statParts []string
+	totalTok := m.totalInputTok + m.totalOutputTok
+	if totalTok > 0 {
+		statParts = append(statParts, formatTokens(totalTok))
 	}
-	lines := wrapText(value, wrapWidth)
-
-	const maxFieldLines = 6
-	truncated := false
-	if len(lines) > maxFieldLines {
-		lines = lines[:maxFieldLines]
-		truncated = true
+	// Cache %
+	totalIn := m.lastInputTok + m.lastCacheRead + m.lastCacheCreation
+	if totalIn > 0 && m.lastCacheRead > 0 {
+		pct := float64(m.lastCacheRead) / float64(totalIn) * 100
+		statParts = append(statParts, fmt.Sprintf("%d%%", int(pct)))
 	}
+	statParts = append(statParts, fmt.Sprintf("($%.2f)", m.totalCost))
+	stats := statsStyle.Render(strings.Join(statParts, "  "))
 
-	for i, line := range lines {
-		if i == 0 {
-			sb.WriteString(borderStyle.Render("  │ ") + valueStyle.Render(prefix+line) + "\n")
-		} else {
-			sb.WriteString(borderStyle.Render("  │ ") + valueStyle.Render(strings.Repeat(" ", len(prefix))+line) + "\n")
+	// Compute widths — card has 1 padding each side from the style
+	cardInnerW := innerW - 2 // account for PaddingLeft + PaddingRight
+	if cardInnerW < 20 {
+		cardInnerW = 20
+	}
+	statsW := lipgloss.Width(stats)
+	titleMaxW := cardInnerW - statsW - 2
+	if titleMaxW < 10 {
+		titleMaxW = 10
+	}
+	title := titleStyle.Render(truncateRunes(topic, titleMaxW))
+	titleW := lipgloss.Width(title)
+
+	gap := cardInnerW - titleW - statsW
+	if gap < 1 {
+		gap = 1
+	}
+	content := title + strings.Repeat(" ", gap) + stats
+
+	return m.styleHeaderCard.Width(innerW).Render(content)
+}
+
+// conversationTopic derives a short topic from the first user message.
+func (m *ChatModel) conversationTopic() string {
+	for _, e := range m.entries {
+		if e.role == "user" {
+			topic := strings.ReplaceAll(e.text, "\n", " ")
+			topic = strings.TrimSpace(topic)
+			if len(topic) > 60 {
+				topic = topic[:57] + "..."
+			}
+			return topic
 		}
 	}
-	if truncated {
-		dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-		sb.WriteString(borderStyle.Render("  │ ") + dimStyle.Render(strings.Repeat(" ", len(prefix))+"...") + "\n")
+	if m.initModel != "" {
+		return m.initModel
 	}
+	return "New conversation"
 }
